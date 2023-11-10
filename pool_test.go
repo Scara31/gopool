@@ -25,25 +25,28 @@ func TestGoPool(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(fmt.Sprintf("want %s for %v", tc.result, tc.data), func(t *testing.T) {
-			gp := NewGoPool(len(tc.data), func(gp *GoPool, v any) {
-				s := v.(string)
-				if len(s) == 4 {
-					gp.OutChan <- s
-				}
-			})
+			gp := NewGoPool[string, string](
+				len(tc.data),
+				context.Background(),
+				make(chan string),
+				make(chan string),
+				func(gp *GoPool[string, string], v string) {
+					if len(v) == 4 {
+						gp.OutChan <- v
+					}
+				})
 
 			for _, v := range tc.data {
 				gp.InChan <- v
 			}
 
-			doneChan := gp.CollectResults()
+			gp.CloseInChan()
+			// Set default value
+			result := "finished"
 
-			var result string
-			select {
-			case <-doneChan:
-				result = "finished"
-			case v := <-gp.OutChan:
-				result = v.(string)
+			// If any value was received, it will overwrite the initial one
+			for v := range gp.OutChan {
+				result = v
 			}
 
 			if result != tc.result {
@@ -53,7 +56,7 @@ func TestGoPool(t *testing.T) {
 	}
 }
 
-func sleepyWorkerFunction(gp *GoPool, v any) {
+func sleepyWorkerFunction[T1 struct{}, T2 struct{}](gp *GoPool[T1, T2], v T1) {
 	time.Sleep(sleepTime)
 }
 
@@ -62,7 +65,13 @@ const sleepyWorkersNumber = 3
 
 func TestShrink(t *testing.T) {
 	// it takes 1 second to execute the sleepyWorkerFunction
-	gp := NewGoPool(sleepyWorkersNumber, sleepyWorkerFunction)
+	gp := NewGoPool[struct{}, struct{}](
+		sleepyWorkersNumber,
+		context.Background(),
+		make(chan struct{}),
+		make(chan struct{}),
+		sleepyWorkerFunction[struct{}, struct{}],
+	)
 	// leave only 1 running worker
 	gp.Shrink(sleepyWorkersNumber - 1)
 
@@ -72,8 +81,8 @@ func TestShrink(t *testing.T) {
 		gp.InChan <- struct{}{}
 	}
 
-	doneChan := gp.CollectResults()
-	<-doneChan
+	gp.CloseInChan()
+	<-gp.OutChan
 
 	t2 := time.Now()
 
@@ -86,7 +95,13 @@ func TestShrink(t *testing.T) {
 
 func TestGrow(t *testing.T) {
 	// it takes 1 second to execute the sleepyWorkerFunction
-	gp := NewGoPool(1, sleepyWorkerFunction)
+	gp := NewGoPool[struct{}, struct{}](
+		1,
+		context.Background(),
+		make(chan struct{}),
+		make(chan struct{}),
+		sleepyWorkerFunction[struct{}, struct{}],
+	)
 	// grow so much workers, that tasksNumber == sleepyWorkersNumber
 	gp.Grow(sleepyWorkersNumber - 1)
 
@@ -96,8 +111,8 @@ func TestGrow(t *testing.T) {
 		gp.InChan <- struct{}{}
 	}
 
-	doneChan := gp.CollectResults()
-	<-doneChan
+	gp.CloseInChan()
+	<-gp.OutChan
 
 	t2 := time.Now()
 
@@ -141,21 +156,24 @@ func BenchmarkSyncHTTP(b *testing.B) {
 func BenchmarkAsyncHTTP(b *testing.B) {
 	srv := setupTestServer()
 
-	gp := NewGoPool(requestsNumber, func(gp *GoPool, v any) {
-		url := v.(string)
-		if _, err := http.Get(url); err != nil {
-			b.Fatal(err)
-		}
-	})
+	gp := NewGoPool[string, struct{}](
+		requestsNumber,
+		context.Background(),
+		make(chan string),
+		make(chan struct{}),
+		func(gp *GoPool[string, struct{}], url string) {
+			if _, err := http.Get(url); err != nil {
+				b.Fatal(err)
+			}
+		})
 
 	b.ResetTimer()
 	for i := 0; i < 100; i++ {
 		gp.InChan <- urlAddr
 	}
 
-	doneChan := gp.CollectResults()
-
-	<-doneChan
+	gp.CloseInChan()
+	<-gp.OutChan
 
 	b.StopTimer()
 	srv.Shutdown(context.Background())
